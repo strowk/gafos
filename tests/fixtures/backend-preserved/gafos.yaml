@@ -1,0 +1,7 @@
+spec: spec.yaml
+route: route.yaml
+# This backend is a fallback only: the route already carries backendRefs,
+# and an existing backendRefs always wins over this config value.
+backend:
+  name: config-fallback-svc
+  port: 9999

@@ -1,0 +1,4 @@
+spec: spec.yaml
+route: route.yaml
+match:
+  methods: true

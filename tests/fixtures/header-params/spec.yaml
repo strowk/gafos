@@ -1,0 +1,16 @@
+openapi: 3.0.3
+info:
+  title: Header Params
+  version: "1.0"
+paths:
+  /items:
+    get:
+      parameters:
+        - name: X-Api-Key
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: ok

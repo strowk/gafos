@@ -1,0 +1,10 @@
+openapi: 3.0.3
+info:
+  title: Path Prefix
+  version: "1.0"
+paths:
+  /users/{id}:
+    get:
+      responses:
+        "200":
+          description: ok
