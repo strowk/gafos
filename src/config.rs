@@ -215,7 +215,7 @@ mod tests {
 
         assert_eq!(config.spec, PathBuf::from("openapi.yaml"));
         assert_eq!(config.route, PathBuf::from("k8s/httproute.yaml"));
-        assert_eq!(config.match_methods, false);
+        assert!(!config.match_methods);
     }
 
     #[test]
@@ -271,7 +271,8 @@ backend: { name: my-api-svc, port: 8080 }
         let dir = tempfile::tempdir().expect("tempdir");
         let base = dir.path().join("gafos.yaml");
         let local = dir.path().join("gafos.local.yaml");
-        std::fs::write(&base, "spec: openapi.yaml\nroute: k8s/httproute.yaml\n").expect("write base");
+        std::fs::write(&base, "spec: openapi.yaml\nroute: k8s/httproute.yaml\n")
+            .expect("write base");
         std::fs::write(&local, "spec: openapi.yaml\n").expect("write local");
 
         let found = discover(dir.path());

@@ -5,6 +5,37 @@
 Point it at a spec and a route manifest, and it keeps the route's matches in
 sync with the spec's paths, methods, and required parameters.
 
+## Installation
+
+macOS, Linux, or Windows Git Bash:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/strowk/gafos/main/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/strowk/gafos/main/install.ps1 | iex
+```
+
+Both scripts detect your OS/architecture, download the matching release
+binary, and install it (default: `$HOME/.local/bin` on Unix,
+`%LOCALAPPDATA%\gafos\bin` on Windows). Override the target version with
+`GAFOS_VERSION` and the install location with `GAFOS_INSTALL_DIR`.
+
+The repository is currently private, so downloading a release requires a
+`GITHUB_TOKEN` (or `GH_TOKEN`) environment variable set to a token with
+`repo` scope until the repo goes public.
+
+### Build from source
+
+```sh
+cargo build --release
+```
+
+The binary is written to `target/release/gafos`.
+
 ## Enforcement by omission
 
 gafos does not validate requests and does not run as a gateway component. Its
