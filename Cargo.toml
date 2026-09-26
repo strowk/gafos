@@ -1,0 +1,15 @@
+[package]
+name = "gafos"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+argh = "0.1.19"
+oas3 = "0.22.0"
+saphyr = "0.1.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_yaml = "0.9.34"
+similar = "3.2.0"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
