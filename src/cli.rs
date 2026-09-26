@@ -114,6 +114,9 @@ fn parse_backend(spec: &str) -> Result<Backend> {
     let (name, port) = spec
         .split_once(':')
         .ok_or_else(|| anyhow!("invalid --backend {spec:?}: expected \"name:port\""))?;
+    if name.is_empty() {
+        bail!("invalid --backend {spec:?}: service name must not be empty");
+    }
     let port: u16 = port.parse().map_err(|_| {
         anyhow!("invalid --backend {spec:?}: port must be a number between 0 and 65535")
     })?;
@@ -152,7 +155,7 @@ pub fn run(args: Args) -> Result<i32> {
         );
     }
 
-    let rules = translate::build_rules(&ops, &cfg);
+    let rules = translate::build_rules(&ops, &cfg)?;
 
     let existing: Option<String> = if cfg.route.is_file() {
         Some(

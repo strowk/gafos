@@ -154,6 +154,57 @@ fn cli_flag_overrides_config_file() {
 }
 
 #[test]
+fn malformed_path_template_exits_2() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_config(dir.path(), "");
+    let spec = "\
+openapi: 3.0.3
+info:
+  title: Test
+  version: \"1.0\"
+paths:
+  /files/{path:
+    get:
+      responses:
+        \"200\":
+          description: ok
+";
+    std::fs::write(dir.path().join("openapi.yaml"), spec).expect("write spec");
+    std::fs::write(dir.path().join("httproute.yaml"), ROUTE_SKELETON).expect("write route");
+
+    let output = run_gafos(dir.path(), &[]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("/files/{path"),
+        "stderr should name the offending path: {stderr}"
+    );
+}
+
+#[test]
+fn empty_backend_name_is_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_config(dir.path(), "");
+    std::fs::write(dir.path().join("openapi.yaml"), SPEC_HEALTH).expect("write spec");
+    std::fs::write(dir.path().join("httproute.yaml"), ROUTE_SKELETON).expect("write route");
+
+    let output = run_gafos(dir.path(), &["--backend", ":8080"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn idempotent_second_run_no_change() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_config(dir.path(), "");

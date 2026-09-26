@@ -6,6 +6,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use anyhow::{Result, bail};
+
 use crate::config::{Config, PathMatch};
 use crate::openapi::Operation;
 
@@ -14,7 +16,7 @@ use crate::openapi::Operation;
 const MAX_MATCHES_PER_RULE: usize = 64;
 
 /// How a `PathRule`'s value is matched against the request path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PathMatchKind {
     Exact,
     RegularExpression,
@@ -58,21 +60,21 @@ pub struct GeneratedRule {
 /// `[^/]+`, literal runs regex-escaped) under `PathMatch::Regex`, or
 /// `PathPrefix` (the literal prefix up to the first `{`) under
 /// `PathMatch::Prefix`.
-pub fn path_rule(path: &str, strategy: PathMatch) -> PathRule {
+pub fn path_rule(path: &str, strategy: PathMatch) -> Result<PathRule> {
     if !path.contains('{') {
-        return PathRule {
+        return Ok(PathRule {
             kind: PathMatchKind::Exact,
             value: path.to_string(),
-        };
+        });
     }
 
     match strategy {
         PathMatch::Prefix => {
             let idx = path.find('{').expect("templated path checked above");
-            PathRule {
+            Ok(PathRule {
                 kind: PathMatchKind::PathPrefix,
                 value: path[..idx].to_string(),
-            }
+            })
         }
         PathMatch::Regex => {
             let mut value = String::from("^");
@@ -81,17 +83,18 @@ pub fn path_rule(path: &str, strategy: PathMatch) -> PathRule {
                 value.push_str(&escape_regex(&rest[..start]));
                 value.push_str("[^/]+");
                 let after_open = &rest[start..];
-                let end = after_open
-                    .find('}')
-                    .expect("unterminated {param} in path template");
+                let end = match after_open.find('}') {
+                    Some(end) => end,
+                    None => bail!("invalid path template {path:?}: unterminated '{{'"),
+                };
                 rest = &after_open[end + 1..];
             }
             value.push_str(&escape_regex(rest));
             value.push('$');
-            PathRule {
+            Ok(PathRule {
                 kind: PathMatchKind::RegularExpression,
                 value,
-            }
+            })
         }
     }
 }
@@ -123,13 +126,13 @@ fn escape_regex(literal: &str) -> String {
 /// query/header presence lists are merged). Matches are sorted by (path
 /// value, method) for deterministic output, then chunked into
 /// `GeneratedRule`s of at most `MAX_MATCHES_PER_RULE` matches.
-pub fn build_rules(ops: &[Operation], cfg: &Config) -> Vec<GeneratedRule> {
+pub fn build_rules(ops: &[Operation], cfg: &Config) -> Result<Vec<GeneratedRule>> {
     let mut matches: Vec<Match> = if cfg.match_methods {
         ops.iter()
             .map(|op| {
                 let full_path = prepend_base_path(cfg.base_path.as_deref(), &op.path);
-                Match {
-                    path: path_rule(&full_path, cfg.path_match),
+                Ok(Match {
+                    path: path_rule(&full_path, cfg.path_match)?,
                     method: Some(op.method.clone()),
                     query: if cfg.match_query {
                         dedupe_presence(&op.required_query)
@@ -141,15 +144,21 @@ pub fn build_rules(ops: &[Operation], cfg: &Config) -> Vec<GeneratedRule> {
                     } else {
                         Vec::new()
                     },
-                }
+                })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?
     } else {
-        let mut by_path: BTreeMap<String, Match> = BTreeMap::new();
+        // Keyed on the whole (kind, value) pair, not just the string value:
+        // an `Exact` path and a `PathPrefix` path can render to the same
+        // string (e.g. a static "/users/" op alongside a templated
+        // "/users/{id}" op under prefix-match strategy) and must not merge
+        // into one match.
+        let mut by_path: BTreeMap<(PathMatchKind, String), Match> = BTreeMap::new();
         for op in ops {
             let full_path = prepend_base_path(cfg.base_path.as_deref(), &op.path);
-            let path = path_rule(&full_path, cfg.path_match);
-            let entry = by_path.entry(path.value.clone()).or_insert_with(|| Match {
+            let path = path_rule(&full_path, cfg.path_match)?;
+            let key = (path.kind, path.value.clone());
+            let entry = by_path.entry(key).or_insert_with(|| Match {
                 path,
                 method: None,
                 query: Vec::new(),
@@ -172,12 +181,12 @@ pub fn build_rules(ops: &[Operation], cfg: &Config) -> Vec<GeneratedRule> {
             .then_with(|| a.method.cmp(&b.method))
     });
 
-    matches
+    Ok(matches
         .chunks(MAX_MATCHES_PER_RULE)
         .map(|chunk| GeneratedRule {
             matches: chunk.to_vec(),
         })
-        .collect()
+        .collect())
 }
 
 /// Prepend `base_path` to `path`, if set.
@@ -242,7 +251,7 @@ mod tests {
 
     #[test]
     fn static_path_is_exact() {
-        let rule = path_rule("/health", PathMatch::Regex);
+        let rule = path_rule("/health", PathMatch::Regex).unwrap();
 
         assert_eq!(rule.kind, PathMatchKind::Exact);
         assert_eq!(rule.value, "/health");
@@ -250,7 +259,7 @@ mod tests {
 
     #[test]
     fn templated_path_regex_escapes_literals() {
-        let rule = path_rule("/v1.0/users/{id}", PathMatch::Regex);
+        let rule = path_rule("/v1.0/users/{id}", PathMatch::Regex).unwrap();
 
         assert_eq!(rule.kind, PathMatchKind::RegularExpression);
         assert_eq!(rule.value, r"^/v1\.0/users/[^/]+$");
@@ -258,7 +267,7 @@ mod tests {
 
     #[test]
     fn multiple_params_regex() {
-        let rule = path_rule("/a/{x}/b/{y}", PathMatch::Regex);
+        let rule = path_rule("/a/{x}/b/{y}", PathMatch::Regex).unwrap();
 
         assert_eq!(rule.kind, PathMatchKind::RegularExpression);
         assert_eq!(rule.value, "^/a/[^/]+/b/[^/]+$");
@@ -266,7 +275,7 @@ mod tests {
 
     #[test]
     fn prefix_strategy_truncates_at_param() {
-        let rule = path_rule("/users/{id}", PathMatch::Prefix);
+        let rule = path_rule("/users/{id}", PathMatch::Prefix).unwrap();
 
         assert_eq!(rule.kind, PathMatchKind::PathPrefix);
         assert_eq!(rule.value, "/users/");
@@ -280,7 +289,7 @@ mod tests {
         };
         let ops = vec![op("/health", "GET"), op("/users/{id}", "GET")];
 
-        let rules = build_rules(&ops, &cfg);
+        let rules = build_rules(&ops, &cfg).unwrap();
 
         assert_eq!(rules.len(), 1);
         let matches = &rules[0].matches;
@@ -304,7 +313,7 @@ mod tests {
         let cfg = base_cfg();
         let ops = vec![op("/users/{id}", "GET"), op("/users/{id}", "DELETE")];
 
-        let rules = build_rules(&ops, &cfg);
+        let rules = build_rules(&ops, &cfg).unwrap();
 
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].matches.len(), 1);
@@ -319,7 +328,7 @@ mod tests {
         };
         let ops = vec![op("/users/{id}", "GET"), op("/users/{id}", "DELETE")];
 
-        let rules = build_rules(&ops, &cfg);
+        let rules = build_rules(&ops, &cfg).unwrap();
 
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].matches.len(), 2);
@@ -341,7 +350,7 @@ mod tests {
             required_header: vec!["X-Key".to_string()],
         }];
 
-        let rules = build_rules(&ops, &cfg);
+        let rules = build_rules(&ops, &cfg).unwrap();
 
         let m = &rules[0].matches[0];
         assert_eq!(
@@ -371,11 +380,39 @@ mod tests {
         };
         let ops: Vec<Operation> = (0..65).map(|i| op(&format!("/items/{i}"), "GET")).collect();
 
-        let rules = build_rules(&ops, &cfg);
+        let rules = build_rules(&ops, &cfg).unwrap();
 
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[0].matches.len(), 64);
         assert_eq!(rules[1].matches.len(), 1);
+    }
+
+    #[test]
+    fn unterminated_brace_path_is_error() {
+        let result = path_rule("/files/{path", PathMatch::Regex);
+
+        let err = result.expect_err("should error on unterminated brace");
+        assert!(
+            err.to_string().contains("/files/{path"),
+            "error message should name the offending path: {err}"
+        );
+    }
+
+    #[test]
+    fn methods_off_dedup_distinguishes_kind() {
+        let cfg = Config {
+            path_match: PathMatch::Prefix,
+            ..base_cfg()
+        };
+        let ops = vec![op("/users/", "GET"), op("/users/{id}", "DELETE")];
+
+        let rules = build_rules(&ops, &cfg).unwrap();
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].matches.len(), 2);
+        let kinds: BTreeSet<PathMatchKind> = rules[0].matches.iter().map(|m| m.path.kind).collect();
+        assert!(kinds.contains(&PathMatchKind::Exact));
+        assert!(kinds.contains(&PathMatchKind::PathPrefix));
     }
 
     #[test]
@@ -386,7 +423,7 @@ mod tests {
         };
         let ops = vec![op("/b", "GET"), op("/a", "POST"), op("/a", "GET")];
 
-        let rules = build_rules(&ops, &cfg);
+        let rules = build_rules(&ops, &cfg).unwrap();
 
         let seen: Vec<(String, Option<String>)> = rules[0]
             .matches
