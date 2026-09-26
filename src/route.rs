@@ -6,11 +6,14 @@
 //! that `splice` writes into an HTTPRoute manifest, at the byte range found
 //! by `locate_rules`.
 
+use std::io::Write;
 use std::ops::Range;
+use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use saphyr::{LoadableYamlNode, Marker, MarkedYaml};
 
+use crate::config::{Backend, Config};
 use crate::translate::{GeneratedRule, Match, ParamPresence, PathMatchKind};
 
 /// Render the full `rules:` mapping entry (key plus value) for `rules`,
@@ -195,12 +198,27 @@ pub fn locate_rules(manifest: &str) -> Result<RulesLocation> {
         .find(|(k, _)| k.data.as_str() == Some("spec"))
         .ok_or_else(|| anyhow!("HTTPRoute document has no top-level 'spec' key"))?;
     let (spec_key, spec_value) = spec_entry;
-    let spec_map = spec_value
-        .data
-        .as_mapping()
-        .context("HTTPRoute 'spec' is not a mapping")?;
 
-    let entries: Vec<(&MarkedYaml, &MarkedYaml)> = spec_map.iter().collect();
+    // `spec:` with nothing (or only comments) after it parses not as an
+    // empty mapping but as an empty string scalar (saphyr has no distinct
+    // "absent value" representation once a comment follows on its own
+    // indented line). Treat that the same as an empty `spec:` mapping so a
+    // freshly `scaffold`ed manifest — whose `spec:` has only a commented
+    // placeholder line — can still have `rules:` inserted into it.
+    let (entries, null_insert_at): (Vec<(&MarkedYaml, &MarkedYaml)>, Option<usize>) =
+        match spec_value.data.as_mapping() {
+            Some(spec_map) => (spec_map.iter().collect(), None),
+            None if spec_value.data.as_str() == Some("") => {
+                let key_col = spec_key.span.start.col();
+                let key_end = marker_byte(manifest, &spec_key.span.end);
+                let next_line_start = manifest[key_end..]
+                    .find('\n')
+                    .map(|i| key_end + i + 1)
+                    .unwrap_or(manifest.len());
+                (Vec::new(), Some(scan_block_end(manifest, key_col, next_line_start)))
+            }
+            None => bail!("HTTPRoute 'spec' is not a mapping"),
+        };
     let rules_entry = entries
         .iter()
         .find(|(k, _)| k.data.as_str() == Some("rules"));
@@ -227,9 +245,14 @@ pub fn locate_rules(manifest: &str) -> Result<RulesLocation> {
         None => (None, None),
     };
 
-    let spec_start = marker_byte(manifest, &spec_value.span.start);
-    let raw_insert_at = marker_byte(manifest, &spec_value.span.end);
-    let insert_at = snap_to_content_end(manifest, spec_start, raw_insert_at);
+    let insert_at = match null_insert_at {
+        Some(v) => v,
+        None => {
+            let spec_start = marker_byte(manifest, &spec_value.span.start);
+            let raw_insert_at = marker_byte(manifest, &spec_value.span.end);
+            snap_to_content_end(manifest, spec_start, raw_insert_at)
+        }
+    };
 
     Ok(RulesLocation {
         replace,
@@ -271,6 +294,81 @@ pub fn splice(manifest: &str, location: &RulesLocation, entry: &str) -> String {
     }
 }
 
+/// Produce a minimal HTTPRoute manifest document for `name`.
+///
+/// Enough structure for `locate_rules` to find an insertion point under
+/// `spec:` (at `child_indent` 2) for a `rules:` entry: `spec:`'s only
+/// content is a commented `parentRefs:` placeholder, reminding the user to
+/// attach the route to their Gateway themselves.
+pub fn scaffold(name: &str) -> String {
+    format!(
+        "apiVersion: gateway.networking.k8s.io/v1\n\
+         kind: HTTPRoute\n\
+         metadata:\n\
+         \u{20}\u{20}name: {name}\n\
+         spec:\n\
+         \u{20}\u{20}# parentRefs:   (commented placeholder line — the user attaches this to their Gateway)\n"
+    )
+}
+
+/// Choose which `backendRefs` value new/updated rules should carry.
+///
+/// `existing` (the first rule's current `backendRefs`, if any, as captured
+/// by `locate_rules`) always wins, and is passed through unchanged — it is
+/// already in the zero-indent form `render_rules_entry` expects. Otherwise,
+/// `fallback` (typically `cfg.backend`) is rendered as a zero-indent
+/// `backendRefs` list value (dash at column 0). With neither, `None`.
+pub fn resolve_backend_refs(existing: Option<&str>, fallback: Option<&Backend>) -> Option<String> {
+    if let Some(existing) = existing {
+        return Some(existing.to_string());
+    }
+    fallback.map(|backend| format!("- name: {}\n  port: {}", backend.name, backend.port))
+}
+
+/// Render `rules` into `manifest` (scaffolding a fresh HTTPRoute document
+/// first if `manifest` is `None`) and return the resulting manifest text.
+///
+/// Locates the `rules:` entry (or its insertion point) under `spec:`,
+/// resolves which `backendRefs` to attach (an existing value on the
+/// current `rules:` entry wins over `cfg.backend`), renders the new
+/// `rules:` entry, and splices it into place. `manifest` and all other
+/// content around `spec:` (comments, sibling keys, trailing-newline
+/// presence) is preserved exactly.
+pub fn apply(manifest: Option<&str>, rules: &[GeneratedRule], cfg: &Config) -> Result<String> {
+    let owned_scaffold;
+    let manifest_text: &str = match manifest {
+        Some(text) => text,
+        None => {
+            let name = cfg.name.as_deref().unwrap_or("httproute");
+            owned_scaffold = scaffold(name);
+            &owned_scaffold
+        }
+    };
+
+    let location = locate_rules(manifest_text)?;
+    let backend_refs =
+        resolve_backend_refs(location.existing_backend_refs.as_deref(), cfg.backend.as_ref());
+    let entry = render_rules_entry(rules, backend_refs.as_deref(), location.child_indent);
+    Ok(splice(manifest_text, &location, &entry))
+}
+
+/// Write `contents` to `path`, replacing it atomically: a temp file is
+/// written in `path`'s parent directory and then renamed over `path`, so a
+/// crash mid-write never leaves a half-written manifest on disk.
+pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("creating temp file in {}", parent.display()))?;
+    tmp.write_all(contents.as_bytes())
+        .with_context(|| format!("writing temp file for {}", path.display()))?;
+    tmp.persist(path)
+        .with_context(|| format!("persisting temp file to {}", path.display()))?;
+    Ok(())
+}
+
 /// Convert a `saphyr` char-index marker into a byte offset into `s`.
 ///
 /// `saphyr`'s `Marker::index` counts chars, not bytes (despite its doc
@@ -286,6 +384,37 @@ fn marker_byte(s: &str, marker: &Marker) -> usize {
 /// Byte offset of the start of the line containing `byte_idx`.
 fn line_start_byte(s: &str, byte_idx: usize) -> usize {
     s[..byte_idx].rfind('\n').map_or(0, |i| i + 1)
+}
+
+/// Scan forward from `from_byte` (the start of a line) through lines that
+/// are blank or indented more than `key_col`, treating them as still
+/// belonging to the block that started at that column (this is how an
+/// empty `key:` value's commented-out placeholder content is kept intact
+/// rather than treated as a sibling). Returns the byte offset of the first
+/// line that dedents to `key_col` or less, or `s.len()` if none is found.
+fn scan_block_end(s: &str, key_col: usize, from_byte: usize) -> usize {
+    let mut pos = from_byte;
+    loop {
+        if pos >= s.len() {
+            return s.len();
+        }
+        let line_end = s[pos..]
+            .find('\n')
+            .map(|i| pos + i + 1)
+            .unwrap_or(s.len());
+        let line = s[pos..line_end].trim_end_matches(['\n', '\r']);
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            pos = line_end;
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        if indent > key_col {
+            pos = line_end;
+        } else {
+            return pos;
+        }
+    }
 }
 
 /// Snap a `saphyr`-reported "end of value" byte offset back to the end of
@@ -860,5 +989,177 @@ mod tests {
             out4,
             "    rules:\n      - matches:\n          - path:\n              type: Exact\n              value: '/health'\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod apply_tests {
+    use super::*;
+    use crate::config::PathMatch;
+    use crate::translate::PathRule;
+    use std::path::PathBuf;
+
+    fn exact_match(path: &str) -> Match {
+        Match {
+            path: PathRule {
+                kind: PathMatchKind::Exact,
+                value: path.to_string(),
+            },
+            method: None,
+            query: Vec::new(),
+            headers: Vec::new(),
+        }
+    }
+
+    fn test_cfg(name: Option<&str>, backend: Option<Backend>) -> Config {
+        Config {
+            spec: PathBuf::from("openapi.yaml"),
+            route: PathBuf::from("httproute.yaml"),
+            name: name.map(str::to_string),
+            match_methods: false,
+            match_query: false,
+            match_headers: false,
+            path_match: PathMatch::Regex,
+            base_path: None,
+            backend,
+            check: false,
+        }
+    }
+
+    #[test]
+    fn scaffold_has_kind_and_name() {
+        let manifest = scaffold("myapp");
+
+        assert!(manifest.contains("kind: HTTPRoute"));
+        assert!(manifest.contains("name: myapp"));
+
+        // Must also be a valid HTTPRoute skeleton that `locate_rules` can
+        // insert a `rules:` entry into.
+        let location = locate_rules(&manifest).expect("scaffold should be a locatable HTTPRoute");
+        assert!(location.replace.is_none());
+        assert_eq!(location.child_indent, 2);
+    }
+
+    #[test]
+    fn apply_scaffolds_when_missing_then_inserts_rules() {
+        let rules = vec![GeneratedRule {
+            matches: vec![exact_match("/health")],
+        }];
+        let cfg = test_cfg(Some("myapp"), None);
+
+        let result = apply(None, &rules, &cfg).expect("should scaffold and apply");
+
+        assert_eq!(
+            result,
+            "apiVersion: gateway.networking.k8s.io/v1\n\
+             kind: HTTPRoute\n\
+             metadata:\n\
+             \u{20}\u{20}name: myapp\n\
+             spec:\n\
+             \u{20}\u{20}# parentRefs:   (commented placeholder line — the user attaches this to their Gateway)\n\
+             \u{20}\u{20}rules:\n\
+             \u{20}\u{20}\u{20}\u{20}- matches:\n\
+             \u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}- path:\n\
+             \u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}type: Exact\n\
+             \u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}value: '/health'\n"
+        );
+
+        // The result must itself be re-locatable (valid, single HTTPRoute).
+        let location = locate_rules(&result).expect("result should remain a valid HTTPRoute");
+        assert!(location.replace.is_some());
+    }
+
+    #[test]
+    fn resolve_prefers_existing_backend() {
+        let existing = "- name: existing-svc\n  port: 1234";
+        let fallback = Backend {
+            name: "other-svc".to_string(),
+            port: 9999,
+        };
+
+        let resolved = resolve_backend_refs(Some(existing), Some(&fallback));
+
+        assert_eq!(resolved, Some(existing.to_string()));
+    }
+
+    #[test]
+    fn resolve_falls_back_to_config_backend() {
+        let fallback = Backend {
+            name: "my-svc".to_string(),
+            port: 8080,
+        };
+
+        let resolved = resolve_backend_refs(None, Some(&fallback));
+
+        assert_eq!(resolved, Some("- name: my-svc\n  port: 8080".to_string()));
+    }
+
+    #[test]
+    fn resolve_none_when_neither() {
+        let resolved = resolve_backend_refs(None, None);
+
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn apply_preserves_existing_backend_refs_end_to_end() {
+        let manifest = "\
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: demo
+spec:
+  rules:
+    - matches:
+        - path:
+            type: Exact
+            value: /health
+      backendRefs:
+        - name: svc
+          port: 8080
+";
+        let rules = vec![GeneratedRule {
+            matches: vec![exact_match("/new")],
+        }];
+        let cfg = test_cfg(
+            None,
+            Some(Backend {
+                name: "other-svc".to_string(),
+                port: 9999,
+            }),
+        );
+
+        let result = apply(Some(manifest), &rules, &cfg).expect("should apply");
+
+        assert_eq!(
+            result,
+            "\
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: demo
+spec:
+  rules:
+    - matches:
+        - path:
+            type: Exact
+            value: '/new'
+      backendRefs:
+        - name: svc
+          port: 8080
+"
+        );
+    }
+
+    #[test]
+    fn write_atomic_replaces_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("httproute.yaml");
+        std::fs::write(&path, "old contents").expect("write initial file");
+
+        write_atomic(&path, "new contents").expect("should write atomically");
+
+        let contents = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(contents, "new contents");
     }
 }
