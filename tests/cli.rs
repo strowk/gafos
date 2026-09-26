@@ -64,7 +64,12 @@ fn writes_route_from_spec() {
 
     let output = run_gafos(dir.path(), &[]);
 
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let written = std::fs::read_to_string(dir.path().join("httproute.yaml")).expect("read route");
     assert!(written.contains("rules:"), "written manifest: {written}");
@@ -134,10 +139,18 @@ fn cli_flag_overrides_config_file() {
 
     let output = run_gafos(dir.path(), &["--match-methods"]);
 
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let written = std::fs::read_to_string(dir.path().join("httproute.yaml")).expect("read route");
-    assert!(written.contains("method: GET"), "written manifest: {written}");
+    assert!(
+        written.contains("method: GET"),
+        "written manifest: {written}"
+    );
 }
 
 #[test]
@@ -149,11 +162,13 @@ fn idempotent_second_run_no_change() {
 
     let first = run_gafos(dir.path(), &[]);
     assert_eq!(first.status.code(), Some(0));
-    let after_first = std::fs::read_to_string(dir.path().join("httproute.yaml")).expect("read route");
+    let after_first =
+        std::fs::read_to_string(dir.path().join("httproute.yaml")).expect("read route");
 
     let second = run_gafos(dir.path(), &[]);
     assert_eq!(second.status.code(), Some(0));
-    let after_second = std::fs::read_to_string(dir.path().join("httproute.yaml")).expect("read route");
+    let after_second =
+        std::fs::read_to_string(dir.path().join("httproute.yaml")).expect("read route");
 
     assert_eq!(after_first, after_second);
 

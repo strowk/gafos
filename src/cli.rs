@@ -81,9 +81,9 @@ impl Args {
         let path_match = match self.path_match.as_deref() {
             Some("regex") => Some(PathMatch::Regex),
             Some("prefix") => Some(PathMatch::Prefix),
-            Some(other) => bail!(
-                "invalid --path-match value {other:?}: expected \"regex\" or \"prefix\""
-            ),
+            Some(other) => {
+                bail!("invalid --path-match value {other:?}: expected \"regex\" or \"prefix\"")
+            }
             None => None,
         };
         let backend = self.backend.as_deref().map(parse_backend).transpose()?;
@@ -114,9 +114,9 @@ fn parse_backend(spec: &str) -> Result<Backend> {
     let (name, port) = spec
         .split_once(':')
         .ok_or_else(|| anyhow!("invalid --backend {spec:?}: expected \"name:port\""))?;
-    let port: u16 = port
-        .parse()
-        .map_err(|_| anyhow!("invalid --backend {spec:?}: port must be a number between 0 and 65535"))?;
+    let port: u16 = port.parse().map_err(|_| {
+        anyhow!("invalid --backend {spec:?}: port must be a number between 0 and 65535")
+    })?;
     Ok(Backend {
         name: name.to_string(),
         port,

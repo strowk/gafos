@@ -11,7 +11,7 @@ use std::ops::Range;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use saphyr::{LoadableYamlNode, Marker, MarkedYaml};
+use saphyr::{LoadableYamlNode, MarkedYaml, Marker};
 
 use crate::config::{Backend, Config};
 use crate::translate::{GeneratedRule, Match, ParamPresence, PathMatchKind};
@@ -55,7 +55,15 @@ pub fn render_rules_entry(
     for rule in rules {
         out.push_str(&format!("{}- matches:\n", indent(rule_item_indent)));
         for m in &rule.matches {
-            render_match(&mut out, m, match_item_indent, match_key_indent, path_attr_indent, param_item_indent, param_attr_indent);
+            render_match(
+                &mut out,
+                m,
+                match_item_indent,
+                match_key_indent,
+                path_attr_indent,
+                param_item_indent,
+                param_attr_indent,
+            );
         }
         if let Some(refs) = backend_refs {
             out.push_str(&format!("{}backendRefs:\n", indent(rule_key_indent)));
@@ -215,7 +223,10 @@ pub fn locate_rules(manifest: &str) -> Result<RulesLocation> {
                     .find('\n')
                     .map(|i| key_end + i + 1)
                     .unwrap_or(manifest.len());
-                (Vec::new(), Some(scan_block_end(manifest, key_col, next_line_start)))
+                (
+                    Vec::new(),
+                    Some(scan_block_end(manifest, key_col, next_line_start)),
+                )
             }
             None => bail!("HTTPRoute 'spec' is not a mapping"),
         };
@@ -346,8 +357,10 @@ pub fn apply(manifest: Option<&str>, rules: &[GeneratedRule], cfg: &Config) -> R
     };
 
     let location = locate_rules(manifest_text)?;
-    let backend_refs =
-        resolve_backend_refs(location.existing_backend_refs.as_deref(), cfg.backend.as_ref());
+    let backend_refs = resolve_backend_refs(
+        location.existing_backend_refs.as_deref(),
+        cfg.backend.as_ref(),
+    );
     let entry = render_rules_entry(rules, backend_refs.as_deref(), location.child_indent);
     Ok(splice(manifest_text, &location, &entry))
 }
@@ -398,10 +411,7 @@ fn scan_block_end(s: &str, key_col: usize, from_byte: usize) -> usize {
         if pos >= s.len() {
             return s.len();
         }
-        let line_end = s[pos..]
-            .find('\n')
-            .map(|i| pos + i + 1)
-            .unwrap_or(s.len());
+        let line_end = s[pos..].find('\n').map(|i| pos + i + 1).unwrap_or(s.len());
         let line = s[pos..line_end].trim_end_matches(['\n', '\r']);
         let trimmed = line.trim_start();
         if trimmed.is_empty() {
@@ -471,7 +481,10 @@ fn capture_first_backend_refs(manifest: &str, rules_value: &MarkedYaml) -> Optio
         .map(|item| {
             item.data
                 .as_mapping()
-                .and_then(|m| m.iter().find(|(k, _)| k.data.as_str() == Some("backendRefs")))
+                .and_then(|m| {
+                    m.iter()
+                        .find(|(k, _)| k.data.as_str() == Some("backendRefs"))
+                })
                 .map(|(_, v)| extract_zero_indent(manifest, v))
         })
         .collect();
@@ -811,8 +824,7 @@ spec:
 ";
 
         let location = locate_rules(manifest).expect("should locate rules");
-        let entry =
-            "  rules:\n    - matches:\n        - path:\n            type: Exact\n            value: /new\n";
+        let entry = "  rules:\n    - matches:\n        - path:\n            type: Exact\n            value: /new\n";
 
         let spliced = splice(manifest, &location, entry);
 
