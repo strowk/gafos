@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 argh = "0.1.19"
-oas3 = "0.22.0"
+oas3 = { version = "0.22.0", features = ["yaml-spec"] }
 saphyr = "0.1.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_yaml = "0.9.34"
