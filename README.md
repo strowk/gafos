@@ -36,18 +36,6 @@ cargo build --release
 
 The binary is written to `target/release/gafos`.
 
-## Enforcement by omission
-
-gafos does not validate requests and does not run as a gateway component. Its
-contribution to API safety is what it *leaves out* of the `HTTPRoute`: a path,
-method, or parameter that isn't in the OpenAPI spec gets no matching rule, so
-the gateway has nothing to route it to. Undocumented surface is enforced by
-its absence from the generated rules, not by an explicit deny.
-
-Because of this, gafos is meant to run in CI or as a pre-commit step against
-a spec that is the source of truth for the service's API surface — the
-`HTTPRoute` becomes a derived artifact, not something hand-maintained.
-
 ## Usage
 
 ```
@@ -134,6 +122,20 @@ backend:
 `spec` and `route` must be resolved by some layer (config file or `--spec`
 `--route` flags) — gafos exits `2` if either is missing after folding all
 layers.
+
+## Design Philosophy
+
+gafos is designed to solve one problem very well: 
+**keeping an HTTPRoute's `rules:` in a file in sync with a spec file**.
+One file in - one (modified) file out.
+
+There is no goal to run this as a k8s controller or operator,
+gafos is meant to run in CI or as a pre-commit step or manually against
+a spec that is the source of truth for the service's API surface, making
+re-generated HTTPRoute manifest a deterministically derived artifact,
+which should (most likely) still be checked into the repo alongside the spec,
+because you would most likely include in that file other parts besides 
+the `rules:` block, most importantly the `backendRefs:`.
 
 ## Ownership boundary
 
