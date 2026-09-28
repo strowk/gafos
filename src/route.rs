@@ -1,10 +1,24 @@
 //! Renders generated route rules to YAML text, and locates/splices the
-//! `rules:` region of an existing HTTPRoute manifest.
+//! owned region of an existing HTTPRoute manifest.
 //!
-//! Pure text rendering only: no I/O. `render_rules_entry` turns
-//! `translate::GeneratedRule`s into the exact `rules:` mapping entry text
-//! that `splice` writes into an HTTPRoute manifest, at the byte range found
-//! by `locate_rules`.
+//! Pure text rendering only: no I/O. `apply` (the entry point used by
+//! `main`) picks one of two modes, both implemented in terms of
+//! `locate_rules` and `splice`:
+//!
+//! - **Mode 1, in-place splice**: when the manifest has exactly one
+//!   existing rule with a `matches:` key, `render_matches_entry` renders a
+//!   bare `matches:` entry and only that key's value is replaced, leaving
+//!   `backendRefs:`, `timeouts:`, `filters:`, comments, and key order on
+//!   the rule untouched.
+//! - **Mode 2, full regeneration**: otherwise (no existing `rules:`, or
+//!   more than one existing rule). `render_rules_entry` renders the whole
+//!   `rules:` mapping entry, which `splice` writes into the manifest at
+//!   the byte range found by `locate_rules` (or inserts fresh, when
+//!   `rules:` didn't exist).
+//!
+//! Both renderers indent their output by `seq_indent`, the block-sequence
+//! dash offset `detect_seq_indent` reads from the manifest itself — there
+//! is no fixed or configured indentation width.
 
 use std::io::Write;
 use std::ops::Range;
@@ -17,7 +31,9 @@ use crate::config::{Backend, Config};
 use crate::translate::{GeneratedRule, Match, ParamPresence, PathMatchKind};
 
 /// Render the full `rules:` mapping entry (key plus value) for `rules`,
-/// indented so the `rules` key itself sits at `child_indent` spaces.
+/// indented so the `rules` key itself sits at `child_indent` spaces. Used
+/// by `apply`'s full-regeneration mode; see `render_matches_entry` for the
+/// in-place `matches:` splice used when there's exactly one existing rule.
 ///
 /// Each `GeneratedRule` becomes one list item under `rules:`, containing a
 /// `matches:` list (path, then optional method/queryParams/headers) and,
@@ -462,7 +478,10 @@ pub fn resolve_backend_refs(existing: Option<&str>, fallback: Option<&Backend>) 
 /// had one or more rules, this discards any hand-added per-rule fields, so
 /// a warning is printed to stderr first.
 ///
-/// In both modes, `manifest` and all other content around `spec:`
+/// Both modes render at `seq_indent`, the block-sequence dash offset
+/// `detect_seq_indent` reads from `manifest_text` itself, so generated
+/// output matches the file's own indentation style rather than a fixed
+/// one. In both modes, `manifest` and all other content around `spec:`
 /// (comments, sibling keys, trailing-newline presence) is preserved
 /// exactly.
 pub fn apply(manifest: Option<&str>, rules: &[GeneratedRule], cfg: &Config) -> Result<String> {

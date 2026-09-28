@@ -139,24 +139,46 @@ the `rules:` block, most importantly the `backendRefs:`.
 
 ## Ownership boundary
 
-gafos owns exactly one thing in the HTTPRoute manifest: the `rules:` mapping
-entry under `spec:`. Everything else — `apiVersion`, `metadata`, `hostnames`,
-`parentRefs`, comments, key order, indentation, trailing-newline presence —
-is preserved byte-for-byte. If `route` doesn't exist yet, gafos scaffolds a
-minimal HTTPRoute (with a commented `parentRefs:` placeholder reminding you
-to attach it to your Gateway) and inserts `rules:` into that.
+gafos owns exactly one thing in the HTTPRoute manifest: the `matches:` list
+of the managed rule. When the route already has a single rule with a
+`matches:` key, gafos rewrites only that list in place — `backendRefs:`,
+`timeouts:`, `filters:`, any other hand-added field on the rule, comments,
+key order, and the file's own block-sequence indentation style (whether
+list items dash flush with their key or two spaces past it) are all
+preserved byte-for-byte. Everything outside `rules:` — `apiVersion`,
+`metadata`, `hostnames`, `parentRefs`, comments, key order, indentation,
+trailing-newline presence — is likewise untouched.
 
-This means you can hand-edit hostnames, add a `timeouts:` block, or leave a
-comment next to `rules:`, and gafos will never touch it — only the generated
-matches change from run to run.
+gafos regenerates the whole `rules:` block instead of splicing `matches:`
+in two cases:
+
+- **Create** — `route` doesn't exist yet, or has no `rules:` key. gafos
+  scaffolds a minimal HTTPRoute if needed (with a commented `parentRefs:`
+  placeholder reminding you to attach it to your Gateway) and inserts a
+  freshly rendered `rules:` block. No warning; there's nothing to discard.
+- **Fall back** — the route already has more than one rule, or the spec
+  needs more than 64 matches and so must split across multiple rules.
+  Either way there's no single rule to splice `matches:` into, so gafos
+  regenerates `rules:` from scratch and prints to stderr:
+
+  ```
+  warning: route spans multiple rules; hand-added per-rule fields (timeouts, filters) are not preserved
+  ```
+
+In both regeneration cases, the new `rules:` block still matches the file's
+detected indentation style, and everything outside `rules:` is preserved
+byte-for-byte. Only the create and fall-back paths risk losing hand-added
+per-rule fields — the common case (one rule, edited again) never touches
+anything but `matches:`.
 
 ### backendRef precedence
 
 Each generated rule can carry a `backendRefs:` entry, resolved in this order:
 
 1. **Existing** — if the route's current `rules:` already has a
-   `backendRefs:` on its first rule, that value is kept as-is and carried
-   forward untouched.
+   `backendRefs:` on its first rule, that value is kept as-is. On the
+   matches-splice path it's simply left in place, untouched; on a
+   regenerated `rules:` block it's carried forward into the new rule.
 2. **Config** — otherwise, `backend:` from the resolved config (`gafos.yaml`
    or `--backend name:port`) is rendered as the `backendRefs:` value.
 3. **Empty** — otherwise, no `backendRefs:` is emitted at all.
@@ -186,3 +208,5 @@ suite:
 | `header-params` | `--match-headers` / `match.headers`, required headers only. |
 | `backend-preserved` | An existing `backendRefs:` wins over the config's `backend:`. |
 | `scaffold-missing` | Scaffolding a fresh HTTPRoute when `route` doesn't exist yet. |
+| `seq-indent-zero` | A dash-aligned block-sequence style (`rules:` / `- matches:` at the same column) is preserved; only `matches:` changes. |
+| `timeouts-preserved` | A hand-added `timeouts:` block on the rule survives an update; only `matches:` changes. |
