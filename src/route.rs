@@ -396,7 +396,20 @@ fn rule_count_and_sole_matches(
 
 /// Replace the byte range `range` within `manifest` with `entry`. All other
 /// bytes of `manifest` are preserved exactly.
+///
+/// `render_matches_entry`/`render_rules_entry` always end `entry` with
+/// `\n`. When `range` runs all the way to the end of `manifest` and
+/// `manifest` itself has no trailing newline, splicing `entry` verbatim
+/// would introduce one where the original file had none — violating the
+/// byte-for-byte trailing-newline guarantee. In that case only, strip a
+/// single trailing `\n` from `entry` before splicing.
 fn replace_range(manifest: &str, range: &Range<usize>, entry: &str) -> String {
+    let entry = if range.end == manifest.len() && !manifest.ends_with('\n') {
+        entry.strip_suffix('\n').unwrap_or(entry)
+    } else {
+        entry
+    };
+
     let mut out = String::with_capacity(manifest.len() + entry.len());
     out.push_str(&manifest[..range.start]);
     out.push_str(entry);
@@ -641,7 +654,12 @@ fn snap_to_content_end(manifest: &str, region_start: usize, raw_end: usize) -> u
 fn seq_offset(key: &MarkedYaml, value: &MarkedYaml) -> Option<usize> {
     let items = value.data.as_sequence()?;
     let first_item = items.first()?;
-    (first_item.span.start.col() - 2).checked_sub(key.span.start.col())
+    first_item
+        .span
+        .start
+        .col()
+        .checked_sub(2)?
+        .checked_sub(key.span.start.col())
 }
 
 /// Detect how many spaces past its own key a manifest's existing block
@@ -1516,6 +1534,25 @@ spec:
   timeouts:
     request: 5s";
 
+    // Single rule whose `matches:` is genuinely the LAST content in the
+    // entire manifest — no `backendRefs:`/`timeouts:` on the rule, no
+    // sibling of `rules:` at the `spec:` level — and the manifest has no
+    // trailing newline. Unlike `MANIFEST_NO_TRAILING_NL` (which has a
+    // `timeouts:` sibling after `rules:`), the replaced range here ends at
+    // `manifest.len()`, so this is the case that exercises the
+    // `replace_range` end-of-file trailing-newline strip.
+    const MANIFEST_MATCHES_TRULY_LAST_NO_TRAILING_NL: &str = "\
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: demo
+spec:
+  rules:
+    - matches:
+        - path:
+            type: Exact
+            value: /old";
+
     // A comment sits between the rule's `matches:` value and its
     // `backendRefs:` sibling; Mode 1 must not swallow it into the
     // replaced `matches:` range.
@@ -1593,6 +1630,15 @@ spec:
         .unwrap();
         assert!(out.contains("value: '/new'"));
         assert!(out.contains("- name: kept-svc"));
+        // Key order on the rule is untouched: backendRefs (with its
+        // content intact) still precedes the rewritten matches.
+        let backend_pos = out.find("backendRefs:").expect("backendRefs present");
+        let kept_svc_pos = out.find("- name: kept-svc").expect("kept-svc present");
+        let matches_pos = out.find("matches:").expect("matches present");
+        let new_value_pos = out.find("value: '/new'").expect("new value present");
+        assert!(backend_pos < kept_svc_pos);
+        assert!(kept_svc_pos < matches_pos);
+        assert!(matches_pos < new_value_pos);
     }
 
     #[test]
@@ -1606,6 +1652,22 @@ spec:
         .unwrap();
         assert!(!out.ends_with('\n'));
         assert!(out.contains("value: '/new'"));
+    }
+
+    #[test]
+    fn apply_mode1_last_matches_no_trailing_newline() {
+        // `matches:` is the sole rule's only key and the file's last
+        // content; no trailing newline. The splice must not introduce one.
+        assert!(!MANIFEST_MATCHES_TRULY_LAST_NO_TRAILING_NL.ends_with('\n'));
+        let out = apply(
+            Some(MANIFEST_MATCHES_TRULY_LAST_NO_TRAILING_NL),
+            &[one_rule("/new")],
+            &test_cfg(None, None),
+        )
+        .unwrap();
+        assert!(!out.ends_with('\n'));
+        assert!(out.contains("value: '/new'"));
+        assert!(!out.contains("/old"));
     }
 
     #[test]
@@ -1629,6 +1691,7 @@ spec:
         )
         .unwrap();
         assert!(out.contains("value: '/new'"));
+        assert!(!out.contains("/one") && !out.contains("/two"));
     }
 
     #[test]
