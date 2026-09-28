@@ -376,19 +376,23 @@ fn rule_count_and_sole_matches(
     (count, sole_rule_matches)
 }
 
+/// Replace the byte range `range` within `manifest` with `entry`. All other
+/// bytes of `manifest` are preserved exactly.
+fn replace_range(manifest: &str, range: &Range<usize>, entry: &str) -> String {
+    let mut out = String::with_capacity(manifest.len() + entry.len());
+    out.push_str(&manifest[..range.start]);
+    out.push_str(entry);
+    out.push_str(&manifest[range.end..]);
+    out
+}
+
 /// Replace the byte range in `location.replace` with `entry`, or insert
 /// `entry` at `location.insert_at` if there is no existing `rules:` entry
 /// to replace. All other bytes of `manifest` (including a trailing newline,
 /// or its absence) are preserved exactly.
 pub fn splice(manifest: &str, location: &RulesLocation, entry: &str) -> String {
     match &location.replace {
-        Some(range) => {
-            let mut out = String::with_capacity(manifest.len() + entry.len());
-            out.push_str(&manifest[..range.start]);
-            out.push_str(entry);
-            out.push_str(&manifest[range.end..]);
-            out
-        }
+        Some(range) => replace_range(manifest, range, entry),
         None => {
             let mut out = String::with_capacity(manifest.len() + entry.len() + 1);
             out.push_str(&manifest[..location.insert_at]);
@@ -442,12 +446,25 @@ pub fn resolve_backend_refs(existing: Option<&str>, fallback: Option<&Backend>) 
 /// Render `rules` into `manifest` (scaffolding a fresh HTTPRoute document
 /// first if `manifest` is `None`) and return the resulting manifest text.
 ///
-/// Locates the `rules:` entry (or its insertion point) under `spec:`,
-/// resolves which `backendRefs` to attach (an existing value on the
-/// current `rules:` entry wins over `cfg.backend`), renders the new
-/// `rules:` entry, and splices it into place. `manifest` and all other
-/// content around `spec:` (comments, sibling keys, trailing-newline
-/// presence) is preserved exactly.
+/// Two modes, chosen by how `rules` and the existing manifest line up:
+///
+/// **Mode 1** (in-place `matches:` splice): when there is exactly one
+/// generated rule, exactly one existing rule, and that existing rule has a
+/// `matches:` key. Only the existing rule's `matches:` value is replaced
+/// (via `replace_range`); everything else about that rule — `backendRefs`,
+/// hand-added fields like `timeouts` or `filters`, comments, key order — is
+/// left untouched.
+///
+/// **Mode 2** (regenerate): otherwise. The whole `rules:` entry is
+/// re-rendered from `rules` via `render_rules_entry` and spliced in,
+/// carrying over the first existing rule's `backendRefs` (or falling back
+/// to `cfg.backend`) the same way it always has. If the manifest already
+/// had one or more rules, this discards any hand-added per-rule fields, so
+/// a warning is printed to stderr first.
+///
+/// In both modes, `manifest` and all other content around `spec:`
+/// (comments, sibling keys, trailing-newline presence) is preserved
+/// exactly.
 pub fn apply(manifest: Option<&str>, rules: &[GeneratedRule], cfg: &Config) -> Result<String> {
     let owned_scaffold;
     let manifest_text: &str = match manifest {
@@ -460,11 +477,26 @@ pub fn apply(manifest: Option<&str>, rules: &[GeneratedRule], cfg: &Config) -> R
     };
 
     let location = locate_rules(manifest_text)?;
+    let seq_indent = detect_seq_indent(manifest_text);
+
+    if rules.len() == 1
+        && location.existing_rule_count == 1
+        && let Some(ms) = &location.sole_rule_matches
+    {
+        let entry = render_matches_entry(&rules[0].matches, ms.key_indent, seq_indent);
+        return Ok(replace_range(manifest_text, &ms.range, &entry));
+    }
+
+    if location.existing_rule_count >= 1 {
+        eprintln!(
+            "warning: route spans multiple rules; hand-added per-rule fields (timeouts, filters) are not preserved"
+        );
+    }
+
     let backend_refs = resolve_backend_refs(
         location.existing_backend_refs.as_deref(),
         cfg.backend.as_ref(),
     );
-    let seq_indent = detect_seq_indent(manifest_text);
     let entry = render_rules_entry(
         rules,
         backend_refs.as_deref(),
@@ -657,10 +689,10 @@ pub fn detect_seq_indent(manifest: &str) -> usize {
                     .iter()
                     .find(|(k, _)| k.data.as_str() == Some("matches"))
             });
-        if let Some((matches_key, matches_value)) = first_rule_matches {
-            if let Some(offset) = seq_offset(matches_key, matches_value) {
-                return offset;
-            }
+        if let Some((matches_key, matches_value)) = first_rule_matches
+            && let Some(offset) = seq_offset(matches_key, matches_value)
+        {
+            return offset;
         }
     }
 
@@ -1321,7 +1353,7 @@ mod tests {
 
     #[test]
     fn renders_matches_entry_bare_for_splice() {
-        let rules = vec![GeneratedRule {
+        let rules = [GeneratedRule {
             matches: vec![exact_match("/health")],
         }];
         let out = render_matches_entry(&rules[0].matches, 6, 2);
@@ -1376,6 +1408,206 @@ mod apply_tests {
             backend,
             check: false,
         }
+    }
+
+    fn one_rule(path: &str) -> GeneratedRule {
+        GeneratedRule {
+            matches: vec![exact_match(path)],
+        }
+    }
+
+    // Single rule: matches:, then backendRefs:, then timeouts: (all +2
+    // style, matching HTTP_ROUTE_WITH_RULES's layout). `timeouts:`'s
+    // "child" is deliberately dashed at the same column as `timeouts:`
+    // itself (col 6) rather than +2 (col 8) — Mode 1 never re-parses or
+    // re-indents it, so this only needs to be valid YAML and preserved
+    // byte-for-byte, not semantically nested.
+    const MANIFEST_MATCHES_BACKEND_TIMEOUTS: &str = "\
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: demo
+spec:
+  rules:
+    - matches:
+        - path:
+            type: Exact
+            value: /old
+      backendRefs:
+        - name: my-svc
+          port: 8080
+      timeouts:
+      request: 60s
+";
+
+    // Single rule, dash-aligned (S=0): `rules:` items dash at the same
+    // column as `rules:` itself, and `matches:` items dash at the same
+    // column as `matches:` itself.
+    const DASH_ALIGNED_ONE_RULE: &str = "\
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: demo
+spec:
+  rules:
+  - matches:
+    - path:
+        type: Exact
+        value: /old
+";
+
+    // Single rule with `backendRefs:` before `matches:` in the rule
+    // mapping; Mode 1 must find `matches:` regardless of key order and
+    // leave `backendRefs:` (and the key order) untouched.
+    const BACKEND_BEFORE_MATCHES: &str = "\
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: demo
+spec:
+  rules:
+    - backendRefs:
+        - name: kept-svc
+          port: 8080
+      matches:
+        - path:
+            type: Exact
+            value: /old
+";
+
+    // Single rule whose `matches:` is its only (and thus last) key; a
+    // `timeouts:` sibling of `rules:` follows at the `spec:` level, and the
+    // manifest as a whole has no trailing newline. `matches:`'s value span
+    // must skip past the end of the rule mapping and the `rules:` sequence
+    // to stop right before `timeouts:`, leaving the untouched, newline-less
+    // tail exactly as-is.
+    const MANIFEST_NO_TRAILING_NL: &str = "\
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: demo
+spec:
+  rules:
+    - matches:
+        - path:
+            type: Exact
+            value: /old
+  timeouts:
+    request: 5s";
+
+    // A comment sits between the rule's `matches:` value and its
+    // `backendRefs:` sibling; Mode 1 must not swallow it into the
+    // replaced `matches:` range.
+    const MANIFEST_COMMENT_IN_RULE: &str = "\
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: demo
+spec:
+  rules:
+    - matches:
+        - path:
+            type: Exact
+            value: /old
+      # keep me
+      backendRefs:
+        - name: svc
+          port: 8080
+";
+
+    // Two existing rules: Mode 1's single-rule preconditions don't hold,
+    // so `apply` must fall back to Mode 2 (full regeneration).
+    const TWO_RULE_MANIFEST: &str = "\
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: demo
+spec:
+  rules:
+    - matches:
+        - path:
+            type: Exact
+            value: /one
+    - matches:
+        - path:
+            type: Exact
+            value: /two
+";
+
+    #[test]
+    fn apply_mode1_rewrites_matches_preserving_timeouts() {
+        // single rule: matches:, then backendRefs:, then timeouts: (all +2 style)
+        let out = apply(
+            Some(MANIFEST_MATCHES_BACKEND_TIMEOUTS),
+            &[one_rule("/new")],
+            &test_cfg(None, None),
+        )
+        .unwrap();
+        assert!(out.contains("value: '/new'"));
+        assert!(out.contains("timeouts:\n      request: 60s")); // preserved byte-for-byte
+        assert!(out.contains("backendRefs:\n        - name:")); // preserved
+        assert!(!out.contains("/old")); // matches replaced
+    }
+
+    #[test]
+    fn apply_mode1_preserves_zero_seq_indent() {
+        // dash-aligned single-rule manifest; output keeps S=0 and rewrites matches
+        let out = apply(
+            Some(DASH_ALIGNED_ONE_RULE),
+            &[one_rule("/new")],
+            &test_cfg(None, None),
+        )
+        .unwrap();
+        assert!(out.contains("  - matches:\n    - path:"));
+    }
+
+    #[test]
+    fn apply_mode1_matches_not_first_key() {
+        // rule with backendRefs: before matches:; matches rewritten, backendRefs untouched, order kept
+        let out = apply(
+            Some(BACKEND_BEFORE_MATCHES),
+            &[one_rule("/new")],
+            &test_cfg(None, None),
+        )
+        .unwrap();
+        assert!(out.contains("value: '/new'"));
+        assert!(out.contains("- name: kept-svc"));
+    }
+
+    #[test]
+    fn apply_mode1_matches_last_key_no_trailing_newline() {
+        assert!(!MANIFEST_NO_TRAILING_NL.ends_with('\n'));
+        let out = apply(
+            Some(MANIFEST_NO_TRAILING_NL),
+            &[one_rule("/new")],
+            &test_cfg(None, None),
+        )
+        .unwrap();
+        assert!(!out.ends_with('\n'));
+        assert!(out.contains("value: '/new'"));
+    }
+
+    #[test]
+    fn apply_mode1_preserves_comment_between_matches_and_sibling() {
+        let out = apply(
+            Some(MANIFEST_COMMENT_IN_RULE),
+            &[one_rule("/new")],
+            &test_cfg(None, None),
+        )
+        .unwrap();
+        assert!(out.contains("# keep me"));
+    }
+
+    #[test]
+    fn apply_mode2_regenerates_when_multiple_rules() {
+        // two existing rules -> full regeneration, single generated rule replaces the block
+        let out = apply(
+            Some(TWO_RULE_MANIFEST),
+            &[one_rule("/new")],
+            &test_cfg(None, None),
+        )
+        .unwrap();
+        assert!(out.contains("value: '/new'"));
     }
 
     #[test]
