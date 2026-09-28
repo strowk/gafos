@@ -210,6 +210,24 @@ pub struct RulesLocation {
     /// The first rule's `backendRefs` value, if any, in zero-indent form
     /// (see `render_rules_entry`'s doc comment for the exact contract).
     pub existing_backend_refs: Option<String>,
+    /// Number of items in the `spec.rules` sequence: `0` when `rules:` is
+    /// absent, null, or not a sequence.
+    pub existing_rule_count: usize,
+    /// The sole rule's `matches:` entry span, when `existing_rule_count` is
+    /// exactly `1` and that rule mapping has a `matches:` key. `None`
+    /// otherwise, including when there is one rule but it has no `matches:`.
+    pub sole_rule_matches: Option<MatchesSplice>,
+}
+
+/// Byte range of a single rule's existing `matches:` entry, plus the column
+/// its `matches` key sits at, for an in-place `matches:` splice.
+pub struct MatchesSplice {
+    /// Byte range from the `matches` key's own byte (not the start of its
+    /// line, so a preceding `- ` dash is preserved) through the end of its
+    /// value block.
+    pub range: Range<usize>,
+    /// Column the `matches` key sits at.
+    pub key_indent: usize,
 }
 
 /// Locate the `rules:` entry (or the insertion point for one) within the
@@ -308,12 +326,54 @@ pub fn locate_rules(manifest: &str) -> Result<RulesLocation> {
         }
     };
 
+    let (existing_rule_count, sole_rule_matches) =
+        rule_count_and_sole_matches(manifest, rules_entry);
+
     Ok(RulesLocation {
         replace,
         insert_at,
         child_indent,
         existing_backend_refs,
+        existing_rule_count,
+        sole_rule_matches,
     })
+}
+
+/// Compute `RulesLocation::existing_rule_count` and
+/// `RulesLocation::sole_rule_matches` from the `rules:` entry (if any) found
+/// under `spec:`.
+fn rule_count_and_sole_matches(
+    manifest: &str,
+    rules_entry: Option<&(&MarkedYaml, &MarkedYaml)>,
+) -> (usize, Option<MatchesSplice>) {
+    let Some((_, rules_value)) = rules_entry else {
+        return (0, None);
+    };
+    let Some(items) = rules_value.data.as_sequence() else {
+        return (0, None);
+    };
+
+    let count = items.len();
+    if count != 1 {
+        return (count, None);
+    }
+
+    let sole_rule_matches = items[0].data.as_mapping().and_then(|rule_map| {
+        rule_map
+            .iter()
+            .find(|(k, _)| k.data.as_str() == Some("matches"))
+            .map(|(matches_key, matches_value)| {
+                let start = marker_byte(manifest, &matches_key.span.start);
+                let raw_end = marker_byte(manifest, &matches_value.span.end);
+                let end = snap_to_content_end(manifest, start, raw_end);
+                MatchesSplice {
+                    range: start..end,
+                    key_indent: matches_key.span.start.col(),
+                }
+            })
+    });
+
+    (count, sole_rule_matches)
 }
 
 /// Replace the byte range in `location.replace` with `entry`, or insert
@@ -732,6 +792,26 @@ spec:
         value: /health
 ";
 
+    // Same shape as `HTTP_ROUTE_WITH_RULES`'s single-doc `rules:` list, but
+    // with two rule items (reusing the per-doc shape from
+    // `errors_on_multiple_httproutes`, folded into one HTTPRoute).
+    const TWO_RULE_MANIFEST: &str = "\
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: demo
+spec:
+  rules:
+    - matches:
+        - path:
+            type: Exact
+            value: /one
+    - matches:
+        - path:
+            type: Exact
+            value: /two
+";
+
     // No `rules:` at all; `parentRefs:` items dashed in the same column as
     // `parentRefs:` itself.
     const NO_RULES_DASH_ALIGNED: &str = "\
@@ -885,6 +965,32 @@ spec:
             value: /health
 "
         );
+    }
+
+    #[test]
+    fn locate_reports_single_rule_matches_span() {
+        let loc = locate_rules(HTTP_ROUTE_WITH_RULES).unwrap();
+        assert_eq!(loc.existing_rule_count, 1);
+        let ms = loc.sole_rule_matches.expect("single rule with matches");
+        assert_eq!(ms.key_indent, 6);
+        assert_eq!(
+            &HTTP_ROUTE_WITH_RULES[ms.range],
+            "matches:\n        - path:\n            type: Exact\n            value: /health\n"
+        );
+    }
+
+    #[test]
+    fn locate_reports_multiple_rules_no_splice() {
+        let loc = locate_rules(TWO_RULE_MANIFEST).unwrap();
+        assert_eq!(loc.existing_rule_count, 2);
+        assert!(loc.sole_rule_matches.is_none());
+    }
+
+    #[test]
+    fn locate_reports_zero_rules() {
+        let loc = locate_rules(HTTP_ROUTE_NO_RULES).unwrap();
+        assert_eq!(loc.existing_rule_count, 0);
+        assert!(loc.sole_rule_matches.is_none());
     }
 
     #[test]
