@@ -145,3 +145,13 @@ fn backend_preserved() {
 fn scaffold_missing() {
     run_case("scaffold-missing");
 }
+
+#[test]
+fn seq_indent_zero() {
+    run_case("seq-indent-zero");
+}
+
+#[test]
+fn timeouts_preserved() {
+    run_case("timeouts-preserved");
+}
