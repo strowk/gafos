@@ -22,15 +22,23 @@ use crate::translate::{GeneratedRule, Match, ParamPresence, PathMatchKind};
 /// Each `GeneratedRule` becomes one list item under `rules:`, containing a
 /// `matches:` list (path, then optional method/queryParams/headers) and,
 /// when `backend_refs` is `Some`, a `backendRefs:` key attached after it.
+/// Per-match emission is delegated to `render_match_items`.
+///
+/// `seq_indent` is the gap, in spaces, between a block-sequence key's own
+/// column and the `- ` dash of its first item (see `detect_seq_indent`).
+/// Mapping nesting past a dash is always `+2` regardless of `seq_indent`;
+/// only the dash offset itself varies. The rule dash sits at
+/// `child_indent + seq_indent`, and `matches:`/`backendRefs:` (siblings
+/// inside the rule mapping) at `child_indent + seq_indent + 2`.
 ///
 /// `backend_refs` must be the YAML block value that would render under a
 /// `backendRefs:` key starting at column 0 — e.g.
 /// `"- name: my-svc\n  port: 8080"` — with no leading indentation of its
-/// own. Every line of it (blank lines left bare) is re-indented by
-/// `child_indent + 6` spaces, the same indent used for each rule's
-/// `matches:` list items, so it lines up as a sibling of `matches:` inside
-/// the rule mapping. Later tasks that capture `backendRefs` text must
-/// produce it in this zero-indent form.
+/// own. Every line of it (blank lines left bare) is re-indented by the same
+/// indent used for each rule's `matches:` list items (its first dash), so
+/// it lines up as a sibling of `matches:` inside the rule mapping. Later
+/// tasks that capture `backendRefs` text must produce it in this
+/// zero-indent form.
 ///
 /// All scalar `value:`s (path values, and the fixed `'.+'` for param
 /// presence) are single-quoted, since regex path values can contain
@@ -40,31 +48,19 @@ pub fn render_rules_entry(
     rules: &[GeneratedRule],
     backend_refs: Option<&str>,
     child_indent: usize,
+    seq_indent: usize,
 ) -> String {
-    let rule_item_indent = child_indent + 2; // "- matches:" dash
-    let rule_key_indent = child_indent + 4; // "backendRefs:" (sibling of "matches:")
-    let match_item_indent = child_indent + 6; // "- path:" dash, and backendRefs content
-    let match_key_indent = child_indent + 8; // method:/queryParams:/headers: (siblings of "path:")
-    let path_attr_indent = child_indent + 10; // type:/value: under path
-    let param_item_indent = child_indent + 10; // "- name: ..." dash
-    let param_attr_indent = child_indent + 12; // type:/value: under a param item
+    let rule_item_indent = child_indent + seq_indent; // "- matches:" dash
+    let rule_key_indent = child_indent + seq_indent + 2; // "backendRefs:" (sibling of "matches:")
+    let m_indent = rule_key_indent; // "matches:" key column, passed to render_match_items
+    let match_item_indent = m_indent + seq_indent; // "- path:" dash, and backendRefs content
 
     let mut out = String::new();
     out.push_str(&format!("{}rules:\n", indent(child_indent)));
 
     for rule in rules {
         out.push_str(&format!("{}- matches:\n", indent(rule_item_indent)));
-        for m in &rule.matches {
-            render_match(
-                &mut out,
-                m,
-                match_item_indent,
-                match_key_indent,
-                path_attr_indent,
-                param_item_indent,
-                param_attr_indent,
-            );
-        }
+        render_match_items(&mut out, &rule.matches, m_indent, seq_indent);
         if let Some(refs) = backend_refs {
             out.push_str(&format!("{}backendRefs:\n", indent(rule_key_indent)));
             render_backend_refs_block(&mut out, refs, match_item_indent);
@@ -72,6 +68,53 @@ pub fn render_rules_entry(
     }
 
     out
+}
+
+/// Render a bare `matches:` mapping entry (key plus value) for `matches`,
+/// with the `matches` key itself unindented (flush at column 0) — the form
+/// a Mode-1 splice inserts directly at an existing `matches:` key's column.
+///
+/// `m_indent` is the column the `matches` key sits at (or would sit at) in
+/// the surrounding manifest; it governs only the indentation of the
+/// `matches:` value's contents (via `render_match_items`), not the leading
+/// `"matches:\n"` line itself. See `render_match_items` for how `m_indent`
+/// and `seq_indent` combine to produce each item's indent.
+pub fn render_matches_entry(matches: &[Match], m_indent: usize, seq_indent: usize) -> String {
+    let mut out = String::from("matches:\n");
+    render_match_items(&mut out, matches, m_indent, seq_indent);
+    out
+}
+
+/// Emit the `- path:` items of a matches list (no `matches:` key line of
+/// its own) into `out`, shared by `render_matches_entry` and
+/// `render_rules_entry` so both code paths render matches identically.
+///
+/// `m_indent` is the column of the `matches` key that owns this list.
+/// `seq_indent` is the dash offset (see `detect_seq_indent`); mapping
+/// nesting past a dash is always `+2`. Indents: match item dash
+/// `m_indent + seq_indent`; match keys (`method:`/`queryParams:`/
+/// `headers:`, siblings of `path:`) `m_indent + seq_indent + 2`;
+/// `type:`/`value:` under `path:` `m_indent + seq_indent + 4`; param item
+/// dash `m_indent + 2*seq_indent + 2`; param keys
+/// `m_indent + 2*seq_indent + 4`.
+fn render_match_items(out: &mut String, matches: &[Match], m_indent: usize, seq_indent: usize) {
+    let match_item_indent = m_indent + seq_indent;
+    let match_key_indent = m_indent + seq_indent + 2;
+    let path_attr_indent = m_indent + seq_indent + 4;
+    let param_item_indent = m_indent + 2 * seq_indent + 2;
+    let param_attr_indent = m_indent + 2 * seq_indent + 4;
+
+    for m in matches {
+        render_match(
+            out,
+            m,
+            match_item_indent,
+            match_key_indent,
+            path_attr_indent,
+            param_item_indent,
+            param_attr_indent,
+        );
+    }
 }
 
 fn render_match(
@@ -361,7 +404,13 @@ pub fn apply(manifest: Option<&str>, rules: &[GeneratedRule], cfg: &Config) -> R
         location.existing_backend_refs.as_deref(),
         cfg.backend.as_ref(),
     );
-    let entry = render_rules_entry(rules, backend_refs.as_deref(), location.child_indent);
+    let seq_indent = detect_seq_indent(manifest_text);
+    let entry = render_rules_entry(
+        rules,
+        backend_refs.as_deref(),
+        location.child_indent,
+        seq_indent,
+    );
     Ok(splice(manifest_text, &location, &entry))
 }
 
@@ -1070,7 +1119,7 @@ mod tests {
             matches: vec![exact_match("/health")],
         }];
 
-        let out = render_rules_entry(&rules, None, 2);
+        let out = render_rules_entry(&rules, None, 2, 2);
 
         assert_eq!(
             out,
@@ -1092,7 +1141,7 @@ mod tests {
             }],
         }];
 
-        let out = render_rules_entry(&rules, None, 2);
+        let out = render_rules_entry(&rules, None, 2, 2);
 
         assert_eq!(
             out,
@@ -1123,7 +1172,7 @@ mod tests {
             }],
         }];
 
-        let out = render_rules_entry(&rules, None, 2);
+        let out = render_rules_entry(&rules, None, 2, 2);
 
         assert_eq!(
             out,
@@ -1137,7 +1186,7 @@ mod tests {
             matches: vec![exact_match("/health")],
         }];
 
-        let out = render_rules_entry(&rules, Some("- name: my-svc\n  port: 8080"), 2);
+        let out = render_rules_entry(&rules, Some("- name: my-svc\n  port: 8080"), 2, 2);
 
         assert_eq!(
             out,
@@ -1151,8 +1200,8 @@ mod tests {
             matches: vec![exact_match("/health")],
         }];
 
-        let out2 = render_rules_entry(&rules, None, 2);
-        let out4 = render_rules_entry(&rules, None, 4);
+        let out2 = render_rules_entry(&rules, None, 2, 2);
+        let out4 = render_rules_entry(&rules, None, 4, 2);
 
         assert_eq!(
             out2,
@@ -1161,6 +1210,30 @@ mod tests {
         assert_eq!(
             out4,
             "    rules:\n      - matches:\n          - path:\n              type: Exact\n              value: '/health'\n"
+        );
+    }
+
+    #[test]
+    fn renders_matches_entry_bare_for_splice() {
+        let rules = vec![GeneratedRule {
+            matches: vec![exact_match("/health")],
+        }];
+        let out = render_matches_entry(&rules[0].matches, 6, 2);
+        assert_eq!(
+            out,
+            "matches:\n        - path:\n            type: Exact\n            value: '/health'\n"
+        );
+    }
+
+    #[test]
+    fn renders_rules_entry_dash_aligned_when_seq_indent_zero() {
+        let rules = vec![GeneratedRule {
+            matches: vec![exact_match("/health")],
+        }];
+        let out = render_rules_entry(&rules, None, 2, 0);
+        assert_eq!(
+            out,
+            "  rules:\n  - matches:\n    - path:\n        type: Exact\n        value: '/health'\n"
         );
     }
 }
