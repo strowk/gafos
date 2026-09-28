@@ -205,6 +205,52 @@ fn empty_backend_name_is_error() {
 }
 
 #[test]
+fn multi_rule_route_warns_and_succeeds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_config(dir.path(), "");
+    std::fs::write(dir.path().join("openapi.yaml"), SPEC_HEALTH).expect("write spec");
+    let route = "\
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: myroute
+spec:
+  parentRefs:
+    - name: gw
+  rules:
+    - matches:
+        - path:
+            type: Exact
+            value: /health
+      backendRefs:
+        - name: backend-a
+          port: 8080
+    - matches:
+        - path:
+            type: Exact
+            value: /other
+      backendRefs:
+        - name: backend-b
+          port: 8081
+";
+    std::fs::write(dir.path().join("httproute.yaml"), route).expect("write route");
+
+    let output = run_gafos(dir.path(), &[]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("route spans multiple rules"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn idempotent_second_run_no_change() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_config(dir.path(), "");
