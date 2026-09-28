@@ -6,15 +6,17 @@
 //! `locate_rules` and `splice`:
 //!
 //! - **Mode 1, in-place splice**: when the manifest has exactly one
-//!   existing rule with a `matches:` key, `render_matches_entry` renders a
-//!   bare `matches:` entry and only that key's value is replaced, leaving
-//!   `backendRefs:`, `timeouts:`, `filters:`, comments, and key order on
-//!   the rule untouched.
-//! - **Mode 2, full regeneration**: otherwise (no existing `rules:`, or
-//!   more than one existing rule). `render_rules_entry` renders the whole
-//!   `rules:` mapping entry, which `splice` writes into the manifest at
-//!   the byte range found by `locate_rules` (or inserts fresh, when
-//!   `rules:` didn't exist).
+//!   existing rule with a `matches:` key *and* the generated matches fit in
+//!   a single rule, `render_matches_entry` renders a bare `matches:` entry
+//!   and only that key's value is replaced, leaving `backendRefs:`,
+//!   `timeouts:`, `filters:`, comments, and key order on the rule
+//!   untouched.
+//! - **Mode 2, full regeneration**: otherwise (no existing `rules:`, more
+//!   than one existing rule, or the spec needs more than 64 matches and so
+//!   splits into multiple generated rules). `render_rules_entry` renders
+//!   the whole `rules:` mapping entry, which `splice` writes into the
+//!   manifest at the byte range found by `locate_rules` (or inserts fresh,
+//!   when `rules:` didn't exist).
 //!
 //! Both renderers indent their output by `seq_indent`, the block-sequence
 //! dash offset `detect_seq_indent` reads from the manifest itself — there
