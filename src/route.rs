@@ -470,6 +470,103 @@ fn snap_to_content_end(manifest: &str, region_start: usize, raw_end: usize) -> u
     region_start + boundary
 }
 
+/// The gap, in spaces, between `key`'s column and the `- ` dash of
+/// `value`'s first item — e.g. `2` when items dash two spaces past their
+/// key, `0` when the dash lines up with the key itself. `None` when `value`
+/// isn't a non-empty block sequence, or the computed offset would be
+/// negative (a dash shallower than its key, which callers should treat as
+/// not usable).
+fn seq_offset(key: &MarkedYaml, value: &MarkedYaml) -> Option<usize> {
+    let items = value.data.as_sequence()?;
+    let first_item = items.first()?;
+    (first_item.span.start.col() - 2).checked_sub(key.span.start.col())
+}
+
+/// Detect how many spaces past its own key a manifest's existing block
+/// sequences dash their items, so later renders can match `manifest`'s
+/// style instead of always using `gafos`'s own default.
+///
+/// Tries, in order: the HTTPRoute's `spec.rules` sequence itself; failing
+/// that, the first rule's `matches:` sequence; failing that, any other
+/// `spec` child whose value is a non-empty block sequence (e.g.
+/// `parentRefs:`). Returns `2` when none of those qualify, or when
+/// `manifest` doesn't parse as a single HTTPRoute document with a `spec`
+/// mapping.
+pub fn detect_seq_indent(manifest: &str) -> usize {
+    const DEFAULT: usize = 2;
+
+    let Ok(docs) = MarkedYaml::load_from_str(manifest) else {
+        return DEFAULT;
+    };
+
+    let mut http_route: Option<&MarkedYaml> = None;
+    for doc in &docs {
+        let is_http_route = doc
+            .data
+            .as_mapping_get("kind")
+            .and_then(|k| k.data.as_str())
+            == Some("HTTPRoute");
+        if is_http_route {
+            if http_route.is_some() {
+                return DEFAULT;
+            }
+            http_route = Some(doc);
+        }
+    }
+    let Some(http_route) = http_route else {
+        return DEFAULT;
+    };
+
+    let Some(doc_mapping) = http_route.data.as_mapping() else {
+        return DEFAULT;
+    };
+    let Some((_, spec_value)) = doc_mapping
+        .iter()
+        .find(|(k, _)| k.data.as_str() == Some("spec"))
+    else {
+        return DEFAULT;
+    };
+    let Some(entries) = spec_value.data.as_mapping() else {
+        return DEFAULT;
+    };
+
+    let rules_entry = entries
+        .iter()
+        .find(|(k, _)| k.data.as_str() == Some("rules"));
+
+    if let Some((rules_key, rules_value)) = rules_entry {
+        if let Some(offset) = seq_offset(rules_key, rules_value) {
+            return offset;
+        }
+        let first_rule_matches = rules_value
+            .data
+            .as_sequence()
+            .and_then(|items| items.first())
+            .and_then(|rule| rule.data.as_mapping())
+            .and_then(|rule_map| {
+                rule_map
+                    .iter()
+                    .find(|(k, _)| k.data.as_str() == Some("matches"))
+            });
+        if let Some((matches_key, matches_value)) = first_rule_matches {
+            if let Some(offset) = seq_offset(matches_key, matches_value) {
+                return offset;
+            }
+        }
+    }
+
+    for (key, value) in entries.iter() {
+        if key.data.as_str() == Some("rules") {
+            continue;
+        }
+        if let Some(offset) = seq_offset(key, value) {
+            return offset;
+        }
+    }
+
+    DEFAULT
+}
+
 /// Capture the first rule's `backendRefs` value (if any) from a `rules:`
 /// sequence node, in zero-indent form. Warns to stderr (and keeps the
 /// first) if rules carry differing `backendRefs`.
@@ -565,6 +662,70 @@ spec:
   parentRefs:
     - name: gw
 ";
+
+    // Same `rules:` shape as `HTTP_ROUTE_WITH_RULES`, whose items dash two
+    // columns past `rules:` (`rules:` at col 2, `- matches:` dash at col 4).
+    const INDENTED_MANIFEST: &str = HTTP_ROUTE_WITH_RULES;
+
+    // `rules:` items dashed in the same column as `rules:` itself.
+    const DASH_ALIGNED_MANIFEST: &str = "\
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: demo
+spec:
+  parentRefs:
+    - name: gw
+  rules:
+  - matches:
+    - path:
+        type: Exact
+        value: /health
+";
+
+    // No `rules:` at all; `parentRefs:` items dashed in the same column as
+    // `parentRefs:` itself.
+    const NO_RULES_DASH_ALIGNED: &str = "\
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: demo
+spec:
+  parentRefs:
+  - name: gw
+";
+
+    // `spec` has only scalar/mapping children, no block sequences anywhere.
+    const NO_SEQUENCES: &str = "\
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: demo
+spec:
+  timeouts:
+    request: 5s
+";
+
+    #[test]
+    fn seq_indent_detects_dash_aligned() {
+        // rules items dashed in the same column as `rules:` -> 0
+        assert_eq!(detect_seq_indent(DASH_ALIGNED_MANIFEST), 0);
+    }
+    #[test]
+    fn seq_indent_detects_indented() {
+        // rules items dashed two past `rules:` -> 2
+        assert_eq!(detect_seq_indent(INDENTED_MANIFEST), 2);
+    }
+    #[test]
+    fn seq_indent_falls_back_to_parent_refs_when_no_rules() {
+        // no rules:, parentRefs items dash-aligned -> 0
+        assert_eq!(detect_seq_indent(NO_RULES_DASH_ALIGNED), 0);
+    }
+    #[test]
+    fn seq_indent_defaults_to_two_without_sequences() {
+        // spec has only scalar/mapping children -> 2
+        assert_eq!(detect_seq_indent(NO_SEQUENCES), 2);
+    }
 
     #[test]
     fn locates_existing_rules_span() {
